@@ -1885,6 +1885,8 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   guint min_buffers = 0;
   guint max_buffers = 0;
   gboolean has_videometa, has_video_alignment;
+  gboolean need_hw_mem;
+  gboolean force_msdk_pool = FALSE;
 
   GstAllocator *allocator = NULL;
   GstAllocationParams params;
@@ -1908,10 +1910,35 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   if (!allocator)
     gst_allocation_params_init (&params);
 
+  /* A generic video pool cannot serve opaque hardware-memory caps. */
+  need_hw_mem =
+      gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_DMABUF)
+#ifndef _WIN32
+      || gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_VA);
+#else
+      || gst_msdkcaps_has_feature (pool_caps,
+      GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY);
+#endif
+
   if (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query,
         0, &pool, &size, &min_buffers, &max_buffers);
     update_pool = TRUE;
+  }
+
+  /* Remember that a generic placeholder cannot be used later as a
+   * downstream side-pool. The decision must survive until pool selection
+   * below, otherwise a recognized allocator can send us back to configuring
+   * this incompatible pool. */
+  if (need_hw_mem &&
+#ifndef _WIN32
+      (!pool || !GST_IS_VA_POOL (pool))
+#else
+      (!pool || !GST_IS_D3D11_BUFFER_POOL (pool))
+#endif
+      ) {
+    force_msdk_pool = TRUE;
+    gst_clear_object (&pool);
   }
   if (!pool)
     pool = gst_video_buffer_pool_new ();
@@ -1922,7 +1949,11 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
       pool_caps, size, min_buffers, max_buffers);
   gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
 
-  if (!gst_buffer_pool_set_config (pool, pool_config)) {
+  if (need_hw_mem && force_msdk_pool) {
+    GST_INFO_OBJECT (decoder,
+        "Deferring incompatible hardware-memory allocation to MSDK pool");
+    gst_structure_free (pool_config);
+  } else if (!gst_buffer_pool_set_config (pool, pool_config)) {
     pool_config = gst_buffer_pool_get_config (pool);
 
     if (!gst_buffer_pool_config_validate_params (pool_config,
@@ -2004,7 +2035,7 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
    * or d3d allocator), we replace with our own bufferpool and use it.
    */
   if ((has_videometa && has_video_alignment)
-      || !thiz->ds_has_known_allocator) {
+      || !thiz->ds_has_known_allocator || force_msdk_pool) {
     GstStructure *config;
 
     gst_structure_free (pool_config);
