@@ -1874,6 +1874,76 @@ error_pool_config:
   }
 }
 
+#ifndef _WIN32
+static gboolean
+gst_msdkdec_pool_is_importable (GstMsdkDec * thiz, GstBufferPool * pool,
+    GstVideoInfo * info)
+{
+  GstObject *display = NULL;
+  GstVaDisplay *buffer_display;
+  GstBuffer *buffer = NULL;
+  GstVideoMeta *meta;
+  GstMsdkSurface *surface = NULL;
+  gboolean activated_here = FALSE;
+  gboolean ret = FALSE;
+
+  if (!pool || !gst_buffer_pool_has_option (pool,
+          GST_BUFFER_POOL_OPTION_VIDEO_META)) {
+    GST_DEBUG_OBJECT (thiz, "Candidate pool lacks VideoMeta support");
+    return FALSE;
+  }
+
+  if (!GST_IS_VA_POOL (pool) && !gst_buffer_pool_has_option (pool,
+          GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT)) {
+    GST_DEBUG_OBJECT (thiz, "Candidate pool lacks video alignment support");
+    return FALSE;
+  }
+
+  display = gst_msdk_context_get_va_display (thiz->context);
+  if (!display)
+    goto done;
+
+  if (!gst_buffer_pool_is_active (pool)) {
+    if (!gst_buffer_pool_set_active (pool, TRUE))
+      goto done;
+    activated_here = TRUE;
+  }
+
+  if (gst_buffer_pool_acquire_buffer (pool, &buffer, NULL) != GST_FLOW_OK)
+    goto done;
+
+  buffer_display = gst_va_buffer_peek_display (buffer);
+  if (!buffer_display || gst_va_display_get_va_dpy (buffer_display) !=
+      gst_msdk_context_get_handle (thiz->context)) {
+    GST_DEBUG_OBJECT (thiz, "Candidate VA surface uses a different display");
+    goto done;
+  }
+
+  meta = gst_buffer_get_video_meta (buffer);
+  if (!meta || meta->format != GST_VIDEO_INFO_FORMAT (info)
+      || meta->width < GST_VIDEO_INFO_WIDTH (info)
+      || meta->height < GST_VIDEO_INFO_HEIGHT (info)) {
+    GST_DEBUG_OBJECT (thiz, "Candidate VA surface has incompatible video meta");
+    goto done;
+  }
+
+  surface = gst_msdk_import_to_msdk_surface (buffer, thiz->context, info, 0);
+  ret = surface != NULL;
+  if (!ret)
+    GST_DEBUG_OBJECT (thiz, "MSDK could not import candidate VA surface");
+
+done:
+  if (surface)
+    g_slice_free (GstMsdkSurface, surface);
+  if (buffer)
+    gst_buffer_unref (buffer);
+  if (activated_here)
+    gst_buffer_pool_set_active (pool, FALSE);
+  gst_clear_object (&display);
+  return ret;
+}
+#endif
+
 static gboolean
 gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
 {
@@ -1885,6 +1955,8 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   guint min_buffers = 0;
   guint max_buffers = 0;
   gboolean has_videometa, has_video_alignment;
+  gboolean need_hw_mem;
+  gboolean force_msdk_pool = FALSE;
 
   GstAllocator *allocator = NULL;
   GstAllocationParams params;
@@ -1892,6 +1964,8 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   gboolean update_allocator = FALSE;
 
   GstVideoInfo vinfo;
+  GstVideoInfo aligned_info;
+  GstVideoAlignment align = { 0, };
 
   if (!thiz->param.mfx.FrameInfo.Width || !thiz->param.mfx.FrameInfo.Height)
     return FALSE;
@@ -1908,34 +1982,92 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   if (!allocator)
     gst_allocation_params_init (&params);
 
+  /* A generic video pool cannot serve opaque hardware-memory caps. */
+  need_hw_mem =
+      gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_DMABUF)
+#ifndef _WIN32
+      || gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_VA);
+#else
+      || gst_msdkcaps_has_feature (pool_caps,
+      GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY);
+#endif
+
   if (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query,
         0, &pool, &size, &min_buffers, &max_buffers);
     update_pool = TRUE;
   }
-  if (!pool)
+
+  if (need_hw_mem && !pool)
+    force_msdk_pool = TRUE;
+
+#ifdef _WIN32
+  if (need_hw_mem && pool && !GST_IS_D3D11_BUFFER_POOL (pool)) {
+    force_msdk_pool = TRUE;
+    gst_clear_object (&pool);
+  }
+#endif
+  if (!pool && !force_msdk_pool)
     pool = gst_video_buffer_pool_new ();
 
   size = MAX (size, vinfo.size);
-  pool_config = gst_buffer_pool_get_config (pool);
-  gst_buffer_pool_config_set_params (pool_config,
-      pool_caps, size, min_buffers, max_buffers);
-  gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
-
-  if (!gst_buffer_pool_set_config (pool, pool_config)) {
+  if (pool) {
     pool_config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_set_params (pool_config,
+        pool_caps, size, min_buffers, max_buffers);
+    gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
 
-    if (!gst_buffer_pool_config_validate_params (pool_config,
-            pool_caps, size, min_buffers, max_buffers)) {
-      gst_object_unref (pool);
-      pool = gst_video_buffer_pool_new ();
-      gst_buffer_pool_config_set_params (pool_config,
-          pool_caps, size, min_buffers, max_buffers);
-      gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
+    if (need_hw_mem) {
+      guint alloc_w = GST_ROUND_UP_16 (MAX (thiz->param.mfx.FrameInfo.Width,
+              GST_VIDEO_INFO_WIDTH (&vinfo)));
+      guint alloc_h = GST_ROUND_UP_32 (MAX (thiz->param.mfx.FrameInfo.Height,
+              GST_VIDEO_INFO_HEIGHT (&vinfo)));
+
+      aligned_info = vinfo;
+      gst_msdk_set_video_alignment (&aligned_info, alloc_w, alloc_h, &align);
+      gst_video_info_align (&aligned_info, &align);
+      gst_buffer_pool_config_add_option (pool_config,
+          GST_BUFFER_POOL_OPTION_VIDEO_META);
+      gst_buffer_pool_config_add_option (pool_config,
+          GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
+      gst_buffer_pool_config_set_video_alignment (pool_config, &align);
+#ifndef _WIN32
+      gst_buffer_pool_config_set_va_alignment (pool_config, &align);
+#endif
     }
 
-    if (!gst_buffer_pool_set_config (pool, pool_config))
-      return FALSE;
+    if (!gst_buffer_pool_set_config (pool, pool_config)) {
+      if (need_hw_mem) {
+        force_msdk_pool = TRUE;
+      } else {
+        pool_config = gst_buffer_pool_get_config (pool);
+
+        if (!gst_buffer_pool_config_validate_params (pool_config,
+                pool_caps, size, min_buffers, max_buffers)) {
+          gst_object_unref (pool);
+          pool = gst_video_buffer_pool_new ();
+          gst_buffer_pool_config_set_params (pool_config,
+              pool_caps, size, min_buffers, max_buffers);
+          gst_buffer_pool_config_set_allocator (pool_config, allocator,
+              &params);
+        }
+
+        if (!gst_buffer_pool_set_config (pool, pool_config))
+          return FALSE;
+      }
+    } else if (need_hw_mem) {
+#ifndef _WIN32
+      if (!gst_msdkdec_pool_is_importable (thiz, pool, &aligned_info))
+        force_msdk_pool = TRUE;
+#endif
+    }
+
+    if (need_hw_mem && force_msdk_pool) {
+      GST_INFO_OBJECT (decoder,
+          "Downstream pool is not importable; using MSDK pool");
+    }
+
+    pool_config = gst_buffer_pool_get_config (pool);
   }
 
   if (update_allocator)
@@ -1943,21 +2075,9 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   else
     gst_query_add_allocation_param (query, allocator, &params);
 
-  if (update_pool)
-    gst_query_set_nth_allocation_pool (query,
-        0, pool, size, min_buffers, max_buffers);
-  else
-    gst_query_add_allocation_pool (query, pool, size, min_buffers, max_buffers);
-
-  /* Get the buffer pool config decided on by the base class. The base
-     class ensures that there will always be at least a 0th pool in
-     the query. */
-
-  pool_config = gst_buffer_pool_get_config (pool);
-
   has_videometa = gst_query_find_allocation_meta
       (query, GST_VIDEO_META_API_TYPE, NULL);
-  has_video_alignment = gst_buffer_pool_has_option
+  has_video_alignment = pool && gst_buffer_pool_has_option
       (pool, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
 
   /* Get the caps of pool and increase the min and max buffers by async_depth.
@@ -2004,11 +2124,12 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
    * or d3d allocator), we replace with our own bufferpool and use it.
    */
   if ((has_videometa && has_video_alignment)
-      || !thiz->ds_has_known_allocator) {
+      || !thiz->ds_has_known_allocator || force_msdk_pool) {
     GstStructure *config;
 
-    gst_structure_free (pool_config);
-    gst_object_unref (pool);
+    if (pool_config)
+      gst_structure_free (pool_config);
+    gst_clear_object (&pool);
 
     pool = gst_object_ref (thiz->pool);
 
@@ -2065,8 +2186,11 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
         min_buffers);
   }
 
-  gst_query_set_nth_allocation_pool (query, 0, pool, size, min_buffers,
-      max_buffers);
+  if (update_pool)
+    gst_query_set_nth_allocation_pool (query, 0, pool, size, min_buffers,
+        max_buffers);
+  else
+    gst_query_add_allocation_pool (query, pool, size, min_buffers, max_buffers);
 
   gst_object_unref (pool);
 
