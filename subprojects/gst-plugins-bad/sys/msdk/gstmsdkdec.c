@@ -1885,6 +1885,8 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   guint min_buffers = 0;
   guint max_buffers = 0;
   gboolean has_videometa, has_video_alignment;
+  gboolean need_hw_mem;
+  gboolean force_msdk_pool = FALSE;
 
   GstAllocator *allocator = NULL;
   GstAllocationParams params;
@@ -1908,34 +1910,64 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   if (!allocator)
     gst_allocation_params_init (&params);
 
+  /* A generic video pool cannot serve opaque hardware-memory caps. */
+  need_hw_mem =
+      gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_DMABUF)
+#ifndef _WIN32
+      || gst_msdkcaps_has_feature (pool_caps, GST_CAPS_FEATURE_MEMORY_VA);
+#else
+      || gst_msdkcaps_has_feature (pool_caps,
+      GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY);
+#endif
+
   if (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query,
         0, &pool, &size, &min_buffers, &max_buffers);
     update_pool = TRUE;
   }
-  if (!pool)
+
+  if (need_hw_mem && !pool)
+    force_msdk_pool = TRUE;
+
+  if (!pool && !force_msdk_pool)
     pool = gst_video_buffer_pool_new ();
 
   size = MAX (size, vinfo.size);
-  pool_config = gst_buffer_pool_get_config (pool);
-  gst_buffer_pool_config_set_params (pool_config,
-      pool_caps, size, min_buffers, max_buffers);
-  gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
-
-  if (!gst_buffer_pool_set_config (pool, pool_config)) {
+  if (pool) {
     pool_config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_set_params (pool_config,
+        pool_caps, size, min_buffers, max_buffers);
+    gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
 
-    if (!gst_buffer_pool_config_validate_params (pool_config,
-            pool_caps, size, min_buffers, max_buffers)) {
-      gst_object_unref (pool);
-      pool = gst_video_buffer_pool_new ();
-      gst_buffer_pool_config_set_params (pool_config,
-          pool_caps, size, min_buffers, max_buffers);
-      gst_buffer_pool_config_set_allocator (pool_config, allocator, &params);
+    if (!gst_buffer_pool_set_config (pool, pool_config)) {
+      pool_config = NULL;
+      if (need_hw_mem) {
+        force_msdk_pool = TRUE;
+        gst_clear_object (&pool);
+      } else {
+        pool_config = gst_buffer_pool_get_config (pool);
+
+        if (!gst_buffer_pool_config_validate_params (pool_config,
+                pool_caps, size, min_buffers, max_buffers)) {
+          gst_object_unref (pool);
+          pool = gst_video_buffer_pool_new ();
+          gst_buffer_pool_config_set_params (pool_config,
+              pool_caps, size, min_buffers, max_buffers);
+          gst_buffer_pool_config_set_allocator (pool_config, allocator,
+              &params);
+        }
+
+        if (!gst_buffer_pool_set_config (pool, pool_config))
+          return FALSE;
+      }
+    } else {
+      pool_config = gst_buffer_pool_get_config (pool);
     }
 
-    if (!gst_buffer_pool_set_config (pool, pool_config))
-      return FALSE;
+    if (need_hw_mem && force_msdk_pool) {
+      GST_INFO_OBJECT (decoder,
+          "Downstream pool cannot configure hardware caps; using MSDK pool");
+    }
   }
 
   if (update_allocator)
@@ -1943,21 +1975,9 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
   else
     gst_query_add_allocation_param (query, allocator, &params);
 
-  if (update_pool)
-    gst_query_set_nth_allocation_pool (query,
-        0, pool, size, min_buffers, max_buffers);
-  else
-    gst_query_add_allocation_pool (query, pool, size, min_buffers, max_buffers);
-
-  /* Get the buffer pool config decided on by the base class. The base
-     class ensures that there will always be at least a 0th pool in
-     the query. */
-
-  pool_config = gst_buffer_pool_get_config (pool);
-
   has_videometa = gst_query_find_allocation_meta
       (query, GST_VIDEO_META_API_TYPE, NULL);
-  has_video_alignment = gst_buffer_pool_has_option
+  has_video_alignment = pool && gst_buffer_pool_has_option
       (pool, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
 
   /* Get the caps of pool and increase the min and max buffers by async_depth.
@@ -1992,7 +2012,7 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
           GST_IS_VA_DMABUF_ALLOCATOR (allocator)))
     thiz->ds_has_known_allocator = FALSE;
 #else
-  if (!GST_IS_D3D11_BUFFER_POOL (pool)) {
+  if (!pool || !GST_IS_D3D11_BUFFER_POOL (pool)) {
     thiz->ds_has_known_allocator = FALSE;
   }
 #endif
@@ -2004,11 +2024,12 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
    * or d3d allocator), we replace with our own bufferpool and use it.
    */
   if ((has_videometa && has_video_alignment)
-      || !thiz->ds_has_known_allocator) {
+      || !thiz->ds_has_known_allocator || force_msdk_pool) {
     GstStructure *config;
 
-    gst_structure_free (pool_config);
-    gst_object_unref (pool);
+    if (pool_config)
+      gst_structure_free (pool_config);
+    gst_clear_object (&pool);
 
     pool = gst_object_ref (thiz->pool);
 
@@ -2065,8 +2086,11 @@ gst_msdkdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
         min_buffers);
   }
 
-  gst_query_set_nth_allocation_pool (query, 0, pool, size, min_buffers,
-      max_buffers);
+  if (update_pool)
+    gst_query_set_nth_allocation_pool (query, 0, pool, size, min_buffers,
+        max_buffers);
+  else
+    gst_query_add_allocation_pool (query, pool, size, min_buffers, max_buffers);
 
   gst_object_unref (pool);
 
@@ -2078,7 +2102,7 @@ failed_to_parse_caps:
 
 failed_to_create_pool:
   GST_ERROR_OBJECT (decoder, "failed to set buffer pool config");
-  gst_object_unref (pool);
+  gst_clear_object (&pool);
   return FALSE;
 
 error_set_config:
